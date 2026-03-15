@@ -9,11 +9,17 @@ import yfinance as yf
 
 JPX_LISTED_XLS_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
 
-MIN_1Y_RETURN = 0.30
-MIN_SALES_GROWTH = 0.10
-MAX_WORKERS = 8
-SLEEP_BETWEEN = 0.2
+# ====== 条件設定 ======
+MIN_1Y_RETURN = 0.30               # 1年騰落率 +30%以上
+MIN_SALES_GROWTH = 0.10            # 売上成長率 +10%以上
+MIN_MARKET_CAP = 30_000_000_000    # 300億円以上
+MIN_AVG_TRADING_VALUE = 200_000_000  # 平均売買代金 2億円以上
+AVG_TRADING_VALUE_DAYS = 20        # 平均売買代金の計算日数
+MAX_WORKERS = 3                    # Yahoo Financeの制限回避のため控えめ
+SLEEP_BETWEEN = 0.8                # アクセス間隔
 OUTPUT_CSV = "strong_japan_stocks.csv"
+OUTPUT_TICKERS = "tickers.txt"
+# ======================
 
 
 def download_jpx_listed_companies() -> pd.DataFrame:
@@ -81,8 +87,8 @@ def get_latest_two_year_values(income_stmt: pd.DataFrame, row_name: str):
     return latest, prev
 
 
-def calc_financial_conditions(ticker: yf.Ticker):
-    income_stmt = ticker.income_stmt
+def calc_financial_conditions(ticker_obj: yf.Ticker):
+    income_stmt = ticker_obj.income_stmt
     if income_stmt is None or income_stmt.empty:
         return None
 
@@ -118,10 +124,10 @@ def calc_financial_conditions(ticker: yf.Ticker):
     op_margin_uptrend = op_margin_latest > op_margin_prev
 
     return {
-        "sales_growth": sales_growth,
-        "op_margin_latest": op_margin_latest,
-        "op_margin_prev": op_margin_prev,
-        "op_margin_uptrend": op_margin_uptrend,
+        "sales_growth": float(sales_growth),
+        "op_margin_latest": float(op_margin_latest),
+        "op_margin_prev": float(op_margin_prev),
+        "op_margin_uptrend": bool(op_margin_uptrend),
     }
 
 
@@ -141,12 +147,20 @@ def calc_price_conditions(ticker_symbol: str):
     if isinstance(hist.columns, pd.MultiIndex):
         hist.columns = hist.columns.get_level_values(0)
 
-    if "Close" not in hist.columns:
+    required_cols = {"Close", "Volume"}
+    if not required_cols.issubset(set(hist.columns)):
         return None
 
-    close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
-    if len(close) < 220:
+    hist = hist.copy()
+    hist["Close"] = pd.to_numeric(hist["Close"], errors="coerce")
+    hist["Volume"] = pd.to_numeric(hist["Volume"], errors="coerce")
+    hist = hist.dropna(subset=["Close", "Volume"])
+
+    if len(hist) < 220:
         return None
+
+    close = hist["Close"]
+    volume = hist["Volume"]
 
     ma200 = close.rolling(200).mean().iloc[-1]
     latest_close = close.iloc[-1]
@@ -161,13 +175,39 @@ def calc_price_conditions(ticker_symbol: str):
     one_year_return = (latest_close / close_1y_ago) - 1.0
     above_ma200 = latest_close > ma200
 
+    trading_value = close * volume
+    avg_trading_value = trading_value.tail(AVG_TRADING_VALUE_DAYS).mean()
+
     return {
         "latest_close": float(latest_close),
         "ma200": float(ma200),
         "one_year_return": float(one_year_return),
         "above_ma200": bool(above_ma200),
+        "avg_trading_value": float(avg_trading_value),
         "price_date": str(idx_latest.date()),
     }
+
+
+def get_market_cap(ticker_obj: yf.Ticker):
+    market_cap = None
+
+    try:
+        info = ticker_obj.info
+        market_cap = info.get("marketCap")
+        if market_cap is not None:
+            return float(market_cap)
+    except Exception:
+        pass
+
+    try:
+        fast_info = ticker_obj.fast_info
+        market_cap = fast_info.get("market_cap")
+        if market_cap is not None:
+            return float(market_cap)
+    except Exception:
+        pass
+
+    return None
 
 
 def analyze_one(row: pd.Series):
@@ -182,21 +222,37 @@ def analyze_one(row: pd.Series):
         if price_data is None:
             return None
 
+        # まず価格条件
         if not (
-            price_data["one_year_return"] >= MIN_1Y_RETURN and
-            price_data["above_ma200"]
+            price_data["one_year_return"] >= MIN_1Y_RETURN
+            and price_data["above_ma200"]
         ):
             return None
 
-        ticker = yf.Ticker(ticker_symbol)
-        fin_data = calc_financial_conditions(ticker)
+        # 売買代金フィルター
+        if price_data["avg_trading_value"] < MIN_AVG_TRADING_VALUE:
+            return None
+
+        ticker_obj = yf.Ticker(ticker_symbol)
+
+        # 時価総額フィルター
+        market_cap = get_market_cap(ticker_obj)
+        if market_cap is None or market_cap < MIN_MARKET_CAP:
+            return None
+
+        fin_data = calc_financial_conditions(ticker_obj)
         if fin_data is None:
             return None
 
+        # ファンダ条件
         passed = (
-            fin_data["sales_growth"] >= MIN_SALES_GROWTH and
-            fin_data["op_margin_uptrend"]
+            fin_data["sales_growth"] >= MIN_SALES_GROWTH
+            and fin_data["op_margin_uptrend"]
+            and fin_data["op_margin_latest"] >= 0
         )
+
+        if not passed:
+            return None
 
         return {
             "code": code,
@@ -205,15 +261,19 @@ def analyze_one(row: pd.Series):
             "market": market,
             "industry": industry,
             "price_date": price_data["price_date"],
-            "latest_close": price_data["latest_close"],
-            "ma200": price_data["ma200"],
+            "latest_close": round(price_data["latest_close"], 2),
+            "ma200": round(price_data["ma200"], 2),
             "one_year_return_pct": round(price_data["one_year_return"] * 100, 2),
             "above_ma200": price_data["above_ma200"],
+            "avg_trading_value": int(price_data["avg_trading_value"]),
+            "avg_trading_value_oku": round(price_data["avg_trading_value"] / 100_000_000, 2),
+            "market_cap": int(market_cap),
+            "market_cap_oku": round(market_cap / 100_000_000, 2),
             "sales_growth_pct": round(fin_data["sales_growth"] * 100, 2),
-            "op_margin_latest_pct": round(fin_data["op_margin_latest"] * 100, 2),
             "op_margin_prev_pct": round(fin_data["op_margin_prev"] * 100, 2),
+            "op_margin_latest_pct": round(fin_data["op_margin_latest"] * 100, 2),
             "op_margin_uptrend": fin_data["op_margin_uptrend"],
-            "passed": passed,
+            "passed": True,
         }
 
     except Exception as e:
@@ -254,25 +314,42 @@ def main():
 
     passed_df = df[df["passed"] == True].copy()
 
-    sort_cols = []
-    if "one_year_return_pct" in passed_df.columns:
-        sort_cols.append("one_year_return_pct")
-    if "sales_growth_pct" in passed_df.columns:
-        sort_cols.append("sales_growth_pct")
-
-    if sort_cols:
-        passed_df = passed_df.sort_values(sort_cols, ascending=False)
+    sort_cols = [
+        "one_year_return_pct",
+        "sales_growth_pct",
+    ]
+    existing_sort_cols = [c for c in sort_cols if c in passed_df.columns]
+    if existing_sort_cols:
+        passed_df = passed_df.sort_values(existing_sort_cols, ascending=False)
 
     passed_df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+
+    tickers_only = ",".join(passed_df["ticker"].tolist())
+    with open(OUTPUT_TICKERS, "w", encoding="utf-8") as f:
+        f.write(tickers_only)
 
     print("=" * 60)
     print(f"通過銘柄数: {len(passed_df)}")
     print(f"保存先: {OUTPUT_CSV}")
+    print(f"保存先: {OUTPUT_TICKERS}")
     if len(passed_df) > 0:
-        print(passed_df[[
-            "code", "name", "one_year_return_pct",
-            "sales_growth_pct", "op_margin_prev_pct", "op_margin_latest_pct"
-        ]].head(30).to_string(index=False))
+        print("=== ティッカー一覧 ===")
+        print(tickers_only)
+        print("=" * 60)
+        print(
+            passed_df[
+                [
+                    "code",
+                    "name",
+                    "one_year_return_pct",
+                    "sales_growth_pct",
+                    "op_margin_prev_pct",
+                    "op_margin_latest_pct",
+                    "market_cap_oku",
+                    "avg_trading_value_oku",
+                ]
+            ].head(30).to_string(index=False)
+        )
     print("=" * 60)
 
 
