@@ -1,0 +1,33 @@
+name: Monthly Japan Stock Screen
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "5 21 L * *"
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run screen
+        run: python screen_japan_stocks.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: monthly-screen-results
+          path: |
+            strong_japan_stocks.csv
+          retention-days: 30
